@@ -1,5 +1,6 @@
 import React, { useRef } from 'react';
-import { useFrame } from '@react-three/fiber';
+import { useFrame, useThree } from '@react-three/fiber';
+import { useFBO } from '@react-three/drei';
 import * as THREE from 'three';
 
 const vertexShader = `
@@ -13,79 +14,96 @@ const vertexShader = `
 const fragmentShader = `
   varying vec2 vUv;
   uniform float u_time;
+  uniform sampler2D u_feedback_texture;
+  uniform vec2 u_resolution;
 
-  // 2D Random
+  // Noise functions from the previous step...
   float random (vec2 st) {
-      return fract(sin(dot(st.xy,
-                           vec2(12.9898,78.233)))*
-          43758.5453123);
+      return fract(sin(dot(st.xy, vec2(12.9898,78.233)))* 43758.5453123);
   }
 
-  // 2D Noise based on Morgan McGuire @morgan3d
-  // https://www.shadertoy.com/view/4dS3Wd
   float noise (in vec2 st) {
       vec2 i = floor(st);
       vec2 f = fract(st);
-
-      // Four corners in 2D of a tile
-      float a = random(i);
-      float b = random(i + vec2(1.0, 0.0));
-      float c = random(i + vec2(0.0, 1.0));
-      float d = random(i + vec2(1.0, 1.0));
-
       vec2 u = f*f*(3.0-2.0*f);
-      return mix(a, b, u.x) +
-              (c - a)* u.y * (1.0 - u.x) +
-              (d - b) * u.x * u.y;
+      return mix( mix( random( i + vec2(0.0,0.0) ),
+                       random( i + vec2(1.0,0.0) ), u.x),
+                  mix( random( i + vec2(0.0,1.0) ),
+                       random( i + vec2(1.0,1.0) ), u.x), u.y);
   }
 
-  #define NUM_OCTAVES 5
+  // Function to draw a line with a neon glow
+  float neon_line(vec2 p, vec2 a, vec2 b, float width) {
+      vec2 dir = b - a;
+      float l = length(dir);
+      dir /= l;
 
-  float fbm ( in vec2 st) {
-      float value = 0.0;
-      float amplitude = .5;
-      float frequency = 0.;
-      for (int i = 0; i < NUM_OCTAVES; i++) {
-          value += amplitude * noise(st);
-          st *= 2.;
-          amplitude *= .5;
-      }
-      return value;
+      vec2 pa = p - a;
+      float t = clamp(dot(pa, dir), 0.0, l);
+      vec2 proj = a + t * dir;
+
+      float d = distance(p, proj);
+
+      // Neon effect
+      float glow = 1.0 / (d * d * 100.0); // Inverse square for a nice glow
+      glow = smoothstep(0.0, 1.0, glow);
+
+      return glow * smoothstep(width, width * 0.5, d);
   }
 
   void main() {
-      vec2 st = vUv * 3.0;
-      st.x += u_time * 0.1;
-      vec3 color = vec3(0.0);
-      float value = fbm(st);
+      vec2 st = gl_FragCoord.xy / u_resolution.xy;
 
-      color = mix(vec3(0.1, 0.2, 0.8), vec3(0.9, 0.2, 0.2), value);
-      color = mix(color, vec3(0.9, 0.9, 0.9), value * 0.2);
-      color = mix(color, vec3(0.0, 0.0, 0.0), length(vUv - 0.5) * 1.5);
+      // Feedback (the trailing fades)
+      vec4 feedback = texture2D(u_feedback_texture, st);
 
+      // Generate moving lines
+      float line = 0.0;
+      for(float i = 0.0; i < 3.0; i++) {
+          float t = u_time * (0.2 + i * 0.05);
+          vec2 start = vec2(sin(t + i * 2.0) * 0.5, cos(t + i * 3.0) * 0.5);
+          start += vec2(0.5, 0.5); // Center it
 
-      gl_FragColor = vec4(color,1.0);
+          vec2 end = start;
+          for(int j=0; j<10; j++) {
+              end += vec2(noise(end + float(j)) - 0.5, noise(end + float(j) + 10.0) - 0.5) * 0.1;
+          }
+
+          line += neon_line(st, start, end, 0.05);
+      }
+
+      vec3 color = vec3(line);
+      color *= vec3(1.0, 0.2, 0.8); // Brighter Neon color
+
+      // Mix with feedback
+      gl_FragColor = vec4(color + feedback.rgb * 0.92, 1.0);
   }
 `;
 
 const OrganicAnimation = () => {
+  const { size, viewport } = useThree();
+  const fbo = useFBO(size.width, size.height);
   const materialRef = useRef();
 
-  useFrame(({ clock }) => {
-    if(materialRef.current) {
-      materialRef.current.uniforms.u_time.value = clock.getElapsedTime();
-    }
+  useFrame(({ gl, scene, camera, clock }) => {
+    gl.setRenderTarget(fbo);
+    gl.render(scene, camera);
+    materialRef.current.uniforms.u_feedback_texture.value = fbo.texture;
+    materialRef.current.uniforms.u_time.value = clock.getElapsedTime();
+    gl.setRenderTarget(null);
   });
 
   return (
     <mesh>
-      <planeGeometry args={[10, 10, 64, 64]} />
+      <planeGeometry args={[viewport.width, viewport.height]} />
       <shaderMaterial
         ref={materialRef}
         vertexShader={vertexShader}
         fragmentShader={fragmentShader}
         uniforms={{
           u_time: { value: 0.0 },
+          u_feedback_texture: { value: null },
+          u_resolution: { value: new THREE.Vector2(size.width, size.height) }
         }}
       />
     </mesh>
